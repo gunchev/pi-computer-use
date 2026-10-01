@@ -73,12 +73,22 @@ made by the compositor itself and is treated as real.
 ### Known limitations
 
 - **No absolute pointer API.** `NotifyPointerMotionAbsolute` returns
-  `Invalid position` for every coordinate, stream and options combination
-  (upstream defect in xdg-desktop-portal-kde 6.7.5). Absolute targeting is
-  emulated with *park-and-count* relative motion: drive the pointer far
-  off-screen to clamp it to `(0,0)`, then move by the relative delta.
+  `Invalid position` for every coordinate, stream and options combination. Root
+  cause is upstream in `xdg-desktop-portal-kde`: `RemoteDesktopSession`'s
+  `screenSharingEnabled` flag is never set, so `RemoteDesktop.Start` omits the
+  `streams` key, so the portal frontend's stream list is empty and
+  `check_position()` rejects unconditionally. See
+  [`docs/upstream-reports/`](upstream-reports/) for the full analysis.
+  Absolute targeting is emulated with *park-and-count* relative motion: drive the
+  pointer far off-screen to clamp it to `(0,0)`, then move by the relative delta.
   **This passes through the top-left hot corner** — consider disabling KDE
   hot corners (`System Settings → Workspace → Screen Edges`) so parking is inert.
+  The daemon parks automatically before the first absolute action (see
+  [Pointer synchronisation](#pointer-synchronisation)) so a cold start cannot
+  aim from a stale origin.
+- **EIS is not a way around this.** `ConnectToEIS` returns a valid fd and the
+  connection is accepted, but the server never announces a seat, so no device can
+  be created. Documented in the upstream report so it is not re-explored.
 - **Full-display capture only.** The portal screencast covers the whole
   composited screen; per-window capture falls back to full display.
 - **Key names need evdev keycodes.** `gui_keypress` / `gui_hotkey` need
@@ -87,6 +97,31 @@ made by the compositor itself and is treated as real.
 - **Modifiers are held as key presses.** The portal has no modifier field on
   button events, so `shift`/`ctrl`/`alt`/`super` are pressed and released
   around the click.
+
+### Pointer synchronisation
+
+Because absolute positioning is emulated, the daemon keeps a **tracked** pointer
+position. On a fresh daemon that value is only a guess (screen centre), so the first
+absolute action would be aimed from a phantom origin and can land far off target.
+
+The daemon therefore **parks once before the first absolute action** and marks
+itself synchronised; later actions reuse the tracked position and pay nothing.
+
+If something else moves the pointer (the user grabs the mouse, another tool
+injects input), tell the daemon so it re-parks on the next move:
+
+```bash
+# via the daemon socket directly
+python3 - <<'PY'
+import socket, os, json
+p = os.path.join(os.environ["XDG_RUNTIME_DIR"], "pi-compuse-portal.sock")
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(p)
+s.sendall(b'{"cmd":"invalidate"}\n'); print(s.recv(200).decode())
+PY
+```
+
+`{"cmd":"status"}` reports `synced` and the current tracked position, which is
+useful when a click seems to have gone astray.
 
 ### Coordinate mapping
 

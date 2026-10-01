@@ -57,6 +57,7 @@ Newline-delimited JSON over a unix socket. Commands:
   {"cmd":"combo","codes":[int,...]}
   {"cmd":"scroll","ticks":int,"horizontal":bool}
   {"cmd":"park"}
+  {"cmd":"invalidate"}      mark tracked position untrusted (re-parks on next move)
   {"cmd":"shutdown"}
 
 Coordinates are LOGICAL pixels (device px / display scale).
@@ -125,6 +126,10 @@ class Portal:
         self.py = self.geo["logical_h"] // 2
         self.stream = None
         self.rd = None
+        # The tracked position above is a guess until we have parked once. Without
+        # this, the first absolute action after a daemon start is aimed from a
+        # phantom origin (screen centre) and can land far off target.
+        self.synced = False
 
     def _await(self, req_path, what):
         got = {}
@@ -217,9 +222,24 @@ class Portal:
             self._rel(-PARK_STEP, -PARK_STEP)
             time.sleep(0.05)
         self.px = self.py = 0
+        self.synced = True
+
+    def ensure_synced(self):
+        """Park once so subsequent absolute moves are aimed from a known origin.
+
+        Only the first absolute action pays for this; later ones reuse the
+        tracked position until something desynchronises it.
+        """
+        if not self.synced:
+            self.park()
+
+    def invalidate_sync(self):
+        """Mark the tracked position as untrusted (external pointer movement)."""
+        self.synced = False
 
     def move_to(self, x, y):
         """Absolute move emulated with park-and-count (no working absolute API)."""
+        self.ensure_synced()
         x = max(0, min(self.geo["logical_w"] - 1, int(x)))
         y = max(0, min(self.geo["logical_h"] - 1, int(y)))
         if x < self.px or y < self.py:
@@ -315,7 +335,8 @@ class Server:
         c = r.get("cmd")
         with self.lock:
             if c == "status":
-                return dict(ok=True, **p.geo, at=[p.px, p.py], stream=p.stream, rd=p.rd)
+                return dict(ok=True, **p.geo, at=[p.px, p.py], stream=p.stream,
+                          rd=p.rd, synced=p.synced)
             if c == "move":
                 p.move_to(r["x"], r["y"]); return dict(ok=True, at=[p.px, p.py])
             if c == "click":
@@ -340,6 +361,8 @@ class Server:
                 return dict(ok=True)
             if c == "park":
                 p.park(); return dict(ok=True)
+            if c == "invalidate":
+                p.invalidate_sync(); return dict(ok=True, synced=p.synced)
             if c == "shutdown":
                 self.running = False; return dict(ok=True)
         raise ValueError("unknown cmd %r" % c)
