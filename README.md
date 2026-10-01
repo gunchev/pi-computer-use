@@ -20,13 +20,26 @@ On Linux, input goes through `org.freedesktop.portal.RemoteDesktop` rather than 
 pi install git:github.com/swairshah/pi-computer-use
 ```
 
-The extension uses a Swift native helper for mouse/keyboard events, compiled automatically on first use. You'll need:
+Requirements depend on your platform.
+
+### macOS
+
+The extension uses a Swift native helper for mouse/keyboard events, compiled
+automatically on first use. You'll need:
 
 - **Xcode Command Line Tools** — `xcode-select --install` if you don't have them
 - **Accessibility** permission for your terminal (System Settings → Privacy & Security → Accessibility)
 - **Screen Recording** permission for your terminal (System Settings → Privacy & Security → Screen Recording)
 
-For Linux requirements see [Linux](#linux).
+### Linux (KDE Plasma 6 / Wayland)
+
+No compilation step. Needs `spectacle`, `ImageMagick`, the Python D-Bus bindings,
+and a running portal with the KDE backend — see [Linux](#linux) for the exact
+packages and the one-time consent flow.
+
+### Windows
+
+Not supported.
 
 ## Linux
 
@@ -146,12 +159,12 @@ what the daemon expects. On a 3840×2160 display at 150% scale the screenshot is
 
 | Tool | What it does |
 |------|-------------|
-| `gui_click` | Left/right/middle click. Supports modifier keys (Shift+click, Cmd+click, etc.) |
+| `gui_click` | Left/right/middle click. Supports modifier keys (Shift+click, Ctrl/Cmd+click, etc.) |
 | `gui_double_click` | Double-click (select word, open file) |
 | `gui_triple_click` | Triple-click (select line/paragraph) |
 | `gui_right_click` | Right-click (context menu) |
 | `gui_hover` | Hover (tooltips, hover menus) |
-| `gui_drag` | Drag from A to B. Supports modifiers (Option+drag to duplicate) |
+| `gui_drag` | Drag from A to B. Supports modifiers (Option/Alt+drag to duplicate) |
 | `gui_scroll` | Scroll up/down/left/right |
 
 ### Keyboard
@@ -160,7 +173,7 @@ what the daemon expects. On a 3840×2160 display at 150% scale the screenshot is
 |------|-------------|
 | `gui_type` | Type text into a field (optionally click target first) |
 | `gui_keypress` | Press a key (Enter, Tab, Escape, arrows, etc.) |
-| `gui_hotkey` | Keyboard shortcut (Cmd+S, Shift+Cmd+P, etc.) |
+| `gui_hotkey` | Keyboard shortcut (Ctrl/Cmd+S, Shift+Ctrl/Cmd+P, etc.) |
 
 ### Utility
 
@@ -192,10 +205,17 @@ Supported actions: `click`, `right_click`, `double_click`, `triple_click`, `hove
 src/
 ├── index.ts          # Extension entry — registers tools with pi
 ├── runtime.ts        # Screenshot capture, grounding, native input dispatch
+│                     #   (single platform dispatch point: macOS vs Linux)
 ├── grounding.ts      # Vision model grounding (uses pi's model registry + pi-ai)
-├── native-helper.ts  # Embedded Swift source, compiled and cached at runtime
+├── native-helper.ts  # Embedded Swift source, compiled and cached at runtime (macOS)
+├── linux-portal.ts   # Embedded RemoteDesktop-portal daemon + client (Linux/Wayland)
 └── learn.ts          # /learn command — record GUI demos and save as skills
 ```
+
+Both native backends are embedded as source and materialised on demand — the Swift
+helper is compiled to a cached binary, the Python portal daemon is written to
+`$TMPDIR/pi-compuse-linux/` and run as a long-lived process. Neither needs a
+manual build step.
 
 ## Credits
 
