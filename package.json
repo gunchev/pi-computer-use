@@ -11,7 +11,9 @@
   "pi": {
     "extensions": ["./src/index.ts"]
   },
-  "dependencies": {
-    "@sinclair/typebox": "^0.34.48"
+  "peerDependencies": {
+    "@sinclair/typebox": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
   }
 }
