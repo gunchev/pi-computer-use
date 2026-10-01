@@ -1,16 +1,24 @@
 /**
- * Core GUI runtime for macOS.
+ * Core GUI runtime for macOS and Linux/Wayland.
  * Handles screenshot capture, coordinate grounding, and native input dispatch.
  *
  * Design: screenshots are only taken when the agent explicitly requests them
  * (gui_read/gui_screenshot) or when a target needs grounding. Actions like
  * gui_keypress and gui_hotkey never take screenshots. The agent is responsible
  * for planning its own observation cadence.
+ *
+ * Platform split: macOS drives the Swift helper + `screencapture`/`sips`;
+ * Linux drives the RemoteDesktop-portal daemon + `spectacle`/ImageMagick.
+ * `runNativeHelper` is the single dispatch point, so the nativeXxx helpers
+ * below are platform-agnostic.
  */
 import { readFile, rm, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveNativeGuiHelperBinary, execFileAsync } from "./native-helper.js";
+import {
+	ensureLinuxDaemon, linuxCall, linuxCapture, linuxDownsize, linuxGeometry,
+} from "./linux-portal.js";
 import type { GroundingProvider, GroundingResult, GroundingPoint } from "./grounding.js";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -157,6 +165,10 @@ function parsePngDimensions(bytes: Buffer): { width: number; height: number } | 
 
 /** Downsize a screenshot to fit within size/dimension limits using macOS sips. */
 async function downsizeImage(filePath: string, bytes: Buffer, dims: { width: number; height: number } | undefined): Promise<{ bytes: Buffer; mimeType: string; width?: number; height?: number }> {
+	if (process.platform === "linux") {
+		const out = await linuxDownsize(filePath, MAX_IMAGE_DIMENSION, MAX_IMAGE_BYTES);
+		return out ?? { bytes, mimeType: "image/png", width: dims?.width, height: dims?.height };
+	}
 	const w = dims?.width ?? 0;
 	const h = dims?.height ?? 0;
 	const needsResize = w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION;
@@ -202,6 +214,9 @@ async function runAppleScript(script: string, env: Record<string, string | undef
 }
 
 async function runNativeHelper(command: string, env: Record<string, string | undefined>, errorLabel: string): Promise<string> {
+	if (process.platform === "linux") {
+		return runLinuxHelper(command, env, errorLabel);
+	}
 	const binaryPath = await resolveNativeGuiHelperBinary();
 	try {
 		const result = await execFileAsync(binaryPath, [command], {
@@ -214,6 +229,179 @@ async function runNativeHelper(command: string, env: Record<string, string | und
 	} catch (error: any) {
 		const details = [error.stderr?.trim(), error.stdout?.trim()].filter(Boolean).join(" ");
 		throw new Error(`${errorLabel}. ${error.message} ${details}`.trim());
+	}
+}
+
+// ─── Linux dispatch (RemoteDesktop portal) ────────────────────────────────
+
+/** Comma-separated lowercase modifier names → array for the daemon. */
+function parseModifiers(raw: string | undefined): string[] {
+	return (raw ?? "").split(",").map(s => s.trim()).filter(Boolean);
+}
+
+/** Wheel ticks from a pixel-ish delta; portal only supports discrete steps. */
+function wheelTicks(delta: number, axisIsDownPositive: boolean): number {
+	if (!delta) return 0;
+	const mag = Math.max(1, Math.round(Math.abs(delta) / 50));
+	const sign = Math.sign(delta);
+	return axisIsDownPositive ? -sign * mag : sign * mag;
+}
+
+/**
+ * Linux implementation of the native-helper contract.
+ * Accepts the same UNDERSTUDY_GUI_* env vars the macOS Swift helper reads and
+ * maps them onto portal notifications, so no caller had to change.
+ */
+async function runLinuxHelper(command: string, env: Record<string, string | undefined>, errorLabel: string): Promise<string> {
+	try {
+		await ensureLinuxDaemon();
+
+		if (command === "capture-context") {
+			// The portal screencast covers the whole composited screen; per-window
+			// capture is not available, so report the full logical display and let
+			// grounding work off the full-screen image.
+			const geo = await linuxGeometry();
+			return JSON.stringify({
+				display: { bounds: { x: 0, y: 0, width: geo.logical_w, height: geo.logical_h }, index: 1 },
+				windowBounds: null,
+				windowTitle: env.UNDERSTUDY_GUI_WINDOW_TITLE ?? null,
+			});
+		}
+
+		if (command === "cursor-position") {
+			const r = await linuxCall({ cmd: "status" });
+			if (!r.ok) throw new Error(String(r.error ?? "status failed"));
+			const [x, y] = (r.at as number[]) ?? [0, 0];
+			return JSON.stringify({ x, y });
+		}
+
+		if (command === "event") {
+			const mode = env.UNDERSTUDY_GUI_EVENT_MODE ?? "";
+			const x = Number(env.UNDERSTUDY_GUI_X ?? 0);
+			const y = Number(env.UNDERSTUDY_GUI_Y ?? 0);
+			const mods = parseModifiers(env.UNDERSTUDY_GUI_MODIFIERS);
+			let req: Record<string, unknown>;
+			switch (mode) {
+				case "click":        req = { cmd: "click", x, y, button: "left", clicks: 1, mods }; break;
+				case "right_click":  req = { cmd: "click", x, y, button: "right", clicks: 1, mods }; break;
+				case "middle_click": req = { cmd: "click", x, y, button: "middle", clicks: 1, mods }; break;
+				case "double_click": req = { cmd: "click", x, y, button: "left", clicks: 2, mods }; break;
+				case "triple_click": req = { cmd: "click", x, y, button: "left", clicks: 3, mods }; break;
+				case "hover":        req = { cmd: "move", x, y }; break;
+				case "click_and_hold":
+					req = { cmd: "hold", x, y, hold_ms: Number(env.UNDERSTUDY_GUI_HOLD_DURATION_MS ?? 500) };
+					break;
+				case "drag":
+					req = {
+						cmd: "drag",
+						from: [Number(env.UNDERSTUDY_GUI_FROM_X ?? x), Number(env.UNDERSTUDY_GUI_FROM_Y ?? y)],
+						to: [Number(env.UNDERSTUDY_GUI_TO_X ?? x), Number(env.UNDERSTUDY_GUI_TO_Y ?? y)],
+						duration_ms: Number(env.UNDERSTUDY_GUI_DURATION_MS ?? 450),
+						steps: Number(env.UNDERSTUDY_GUI_STEPS ?? 24),
+						mods,
+					};
+					break;
+				case "scroll": {
+					const dx = Number(env.UNDERSTUDY_GUI_SCROLL_X ?? 0);
+					const dy = Number(env.UNDERSTUDY_GUI_SCROLL_Y ?? 0);
+					if (dx) {
+						req = { cmd: "scroll", ticks: wheelTicks(dx, false), horizontal: true };
+					} else if (dy) {
+						req = { cmd: "scroll", ticks: wheelTicks(dy, true), horizontal: false };
+					} else {
+						return JSON.stringify({ ok: true });
+					}
+					break;
+				}
+				default:
+					throw new Error(`unsupported event mode "${mode}" on Linux`);
+			}
+			const r = await linuxCall(req);
+			if (!r.ok) throw new Error(String(r.error ?? "portal call failed"));
+			return JSON.stringify({ ok: true, ...r });
+		}
+
+		if (command === "key" || command === "keypress" || command === "hotkey") {
+			const code = Number(env.UNDERSTUDY_GUI_KEY_CODE ?? NaN);
+			if (!Number.isFinite(code)) {
+				throw new Error(
+					"Linux input needs a numeric UNDERSTUDY_GUI_KEY_CODE (evdev keycode). " +
+					"Named-key translation is not implemented.",
+				);
+			}
+			const repeat = Math.max(1, Number(env.UNDERSTUDY_GUI_REPEAT ?? 1));
+			const mods = parseModifiers(env.UNDERSTUDY_GUI_MODIFIERS);
+			for (let i = 0; i < repeat; i++) {
+				if (mods.length) {
+					const r = await linuxCall({ cmd: "combo", codes: [...mods.map(modCode), code] });
+					if (!r.ok) throw new Error(String(r.error ?? "combo failed"));
+				} else {
+					const r = await linuxCall({ cmd: "key", code });
+					if (!r.ok) throw new Error(String(r.error ?? "key failed"));
+				}
+			}
+			return JSON.stringify({ ok: true });
+		}
+
+		throw new Error(`unsupported native command "${command}" on Linux`);
+	} catch (error: any) {
+		const details = [error.stderr?.trim?.(), error.stdout?.trim?.(), error.message]
+			.filter(Boolean).join(" ");
+		throw new Error(`${errorLabel}. ${details}`.trim());
+	}
+}
+
+/** evdev keycodes for the modifier names the extension passes around. */
+function modCode(name: string): number {
+	const map: Record<string, number> = {
+		shift: 42, control: 29, ctrl: 29, alt: 56, option: 56,
+		meta: 125, super: 125, command: 125, cmd: 125,
+	};
+	const c = map[name.toLowerCase()];
+	if (c === undefined) throw new Error(`unknown modifier "${name}"`);
+	return c;
+}
+
+/**
+ * Linux full-display capture.
+ * captureRect is set to the LOGICAL display bounds so the existing
+ * `captureRect.origin + imagePoint / scale` math in groundTarget() yields
+ * logical pixels — exactly what the portal daemon expects. The image itself is
+ * device pixels, so scale comes out as the display scale factor (e.g. 1.5).
+ */
+async function captureScreenshotLinux(params: {
+	appName?: string;
+	captureMode?: "window" | "display";
+	windowTitle?: string;
+	windowTitleContains?: string;
+	windowIndex?: number;
+}): Promise<ScreenshotArtifact> {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-compuse-screenshot-"));
+	const filePath = join(tempDir, "screenshot.png");
+	try {
+		await ensureLinuxDaemon();
+		await linuxCapture(filePath);
+		const bytes = Buffer.from(await readFile(filePath));
+		const dims = parsePngDimensions(bytes);
+		const geo = await linuxGeometry();
+		const captureRect: Rect = {
+			x: 0, y: 0, width: geo.logical_w, height: geo.logical_h,
+		};
+		const scaleX = dims && captureRect.width > 0 ? dims.width / captureRect.width : 1;
+		const scaleY = dims && captureRect.height > 0 ? dims.height / captureRect.height : 1;
+		return {
+			bytes, filePath, mimeType: "image/png",
+			captureRect, scaleX, scaleY,
+			imageWidth: dims?.width, imageHeight: dims?.height,
+			appName: params.appName, windowTitle: params.windowTitle,
+			cleanup: async () => { await rm(tempDir, { recursive: true, force: true }).catch(() => {}); },
+		};
+	} catch (error: any) {
+		await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+		throw new Error(
+			`Screenshot capture failed on Linux. Ensure Spectacle is installed and the ` +
+			`portal screen-share consent was granted. ${error.message}`,
+		);
 	}
 }
 
@@ -235,6 +423,9 @@ export class GuiRuntime {
 		windowTitleContains?: string;
 		windowIndex?: number;
 	} = {}): Promise<ScreenshotArtifact> {
+		if (process.platform === "linux") {
+			return captureScreenshotLinux(params);
+		}
 		const contextRaw = await runNativeHelper("capture-context", {
 			UNDERSTUDY_GUI_APP: params.appName?.trim(),
 			UNDERSTUDY_GUI_ACTIVATE_APP: "1",

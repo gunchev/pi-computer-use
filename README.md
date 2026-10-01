@@ -1,16 +1,18 @@
 # pi-computer-use
 
-[Pi](https://github.com/badlogic/pi-mono) extension for GUI computer-use on macOS. Gives your agent eyes and hands — it can see the screen, find UI elements, and interact with any app through native mouse/keyboard events.
+[Pi](https://github.com/badlogic/pi-mono) extension for GUI computer-use on macOS and Linux/Wayland. Gives your agent eyes and hands — it can see the screen, find UI elements, and interact with any app through native mouse/keyboard events.
 
 Useful for launching, testing, and debugging GUI applications from pi.
 
 ## How it works
 
-1. **Screenshot** — captures the screen or app window via macOS `screencapture`
+1. **Screenshot** — captures the screen or app window (macOS `screencapture`; Linux `spectacle`)
 2. **Grounding** — sends the screenshot + a target description (e.g. `'button labeled "Save"'`) to a vision model to get pixel coordinates
-3. **Action** — dispatches native input events via a compiled Swift helper
+3. **Action** — dispatches native input events (macOS: compiled Swift helper; Linux: the `RemoteDesktop` portal)
 
-The Swift binary is compiled on first use and cached. No manual build step needed.
+On macOS the Swift binary is compiled on first use and cached. No manual build step needed.
+
+On Linux, input goes through `org.freedesktop.portal.RemoteDesktop` rather than raw `uinput`. See [Linux](#linux) for why.
 
 ## Install
 
@@ -23,6 +25,76 @@ The extension uses a Swift native helper for mouse/keyboard events, compiled aut
 - **Xcode Command Line Tools** — `xcode-select --install` if you don't have them
 - **Accessibility** permission for your terminal (System Settings → Privacy & Security → Accessibility)
 - **Screen Recording** permission for your terminal (System Settings → Privacy & Security → Screen Recording)
+
+For Linux requirements see [Linux](#linux).
+
+## Linux
+
+Supported: **KDE Plasma 6 on Wayland** (verified on Plasma 6.7.5 / xdg-desktop-portal 1.22.1).
+GNOME and wlroots compositors should work with the same portal calls but are untested.
+
+### Requirements
+
+```bash
+# Fedora
+sudo dnf install spectacle python3-dbus python3-gobject kscreen
+# Debian / Ubuntu
+sudo apt install spectacle python3-dbus python3-gi kde-config-screen
+dnf install ImageMagick   # or apt install imagemagick — used to downsize screenshots
+```
+
+Plus a running `xdg-desktop-portal` with the KDE backend (`xdg-desktop-portal-kde`).
+
+### First run
+
+The first action pops **KDE consent dialogs** asking to share the screen and to allow
+keyboard/pointer control. Approve them (tick *remember* where offered) — the session
+then persists. `pi` deliberately does **not** contact the portal at session start, so
+you are never prompted implicitly.
+
+A long-lived daemon owns the portal session, because portal sessions are killed when
+the D-Bus connection that created them exits. It is started on demand and listens on
+`$XDG_RUNTIME_DIR/pi-compuse-portal.sock`.
+
+```bash
+# inspect / restart the input daemon
+python3 $XDG_RUNTIME_DIR/../tmp/pi-compuse-linux/pi-compuse-portal-*.py --help
+rm -f $XDG_RUNTIME_DIR/pi-compuse-portal.sock   # forces a fresh daemon + consent
+```
+
+### Why the portal and not `uinput`
+
+A raw `uinput` tablet (`BTN_TOOL_PEN` + `ABS_X/Y`) or touchscreen
+(`ABS_MT_*` + `BTN_TOUCH`) delivers events that reach libinput **pixel-exact** — but
+KDE Plasma ignores synthetic tablet/touch input for UI interaction; that path
+exists for drawing tablets feeding apps such as Krita. Portal-created input is
+made by the compositor itself and is treated as real.
+
+### Known limitations
+
+- **No absolute pointer API.** `NotifyPointerMotionAbsolute` returns
+  `Invalid position` for every coordinate, stream and options combination
+  (upstream defect in xdg-desktop-portal-kde 6.7.5). Absolute targeting is
+  emulated with *park-and-count* relative motion: drive the pointer far
+  off-screen to clamp it to `(0,0)`, then move by the relative delta.
+  **This passes through the top-left hot corner** — consider disabling KDE
+  hot corners (`System Settings → Workspace → Screen Edges`) so parking is inert.
+- **Full-display capture only.** The portal screencast covers the whole
+  composited screen; per-window capture falls back to full display.
+- **Key names need evdev keycodes.** `gui_keypress` / `gui_hotkey` need
+  `UNDERSTUDY_GUI_KEY_CODE` (e.g. `29`=Ctrl, `60`=F2). Named-key translation
+  is not implemented on Linux yet.
+- **Modifiers are held as key presses.** The portal has no modifier field on
+  button events, so `shift`/`ctrl`/`alt`/`super` are pressed and released
+  around the click.
+
+### Coordinate mapping
+
+The screencast stream reports **logical** pixels (device pixels ÷ display scale).
+`captureRect` is set to the logical display bounds, so the existing
+`captureRect.origin + imagePoint / scale` math yields logical pixels — exactly
+what the daemon expects. On a 3840×2160 display at 150% scale the screenshot is
+3840×2160 but coordinates are in 2560×1440 space.
 
 ## Tools
 

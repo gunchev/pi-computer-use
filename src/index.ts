@@ -569,10 +569,59 @@ export default function piCompuse(pi: ExtensionAPI) {
 	// ─── Notify on load ────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
-		if (process.platform !== "darwin") {
-			ctx.ui.notify("pi-compuse: GUI tools are macOS-only. They won't work on this platform.", "warning");
+		if (process.platform === "darwin") {
+			ctx.ui.setStatus("pi-compuse", "🖥️ GUI tools active");
 			return;
 		}
-		ctx.ui.setStatus("pi-compuse", "🖥️ GUI tools active");
+		if (process.platform === "linux") {
+			const missing = linuxMissingPrereqs();
+			if (missing.length) {
+				ctx.ui.notify(
+					`pi-compuse: Linux GUI tools unavailable, missing: ${missing.join(", ")}. ` +
+					`See README (Linux).`,
+					"warning",
+				);
+				return;
+			}
+			const wayland = !!process.env.WAYLAND_DISPLAY;
+			ctx.ui.setStatus(
+				"pi-compuse",
+				wayland ? "🖥️ GUI tools active (Wayland portal)" : "🖥️ GUI tools active (Linux)",
+			);
+			return;
+		}
+		ctx.ui.notify("pi-compuse: GUI tools support macOS and Linux only.", "warning");
 	});
+}
+
+/**
+ * Cheap, non-invasive prerequisite check for the Linux backend.
+ * Deliberately does NOT contact the portal — a first portal call triggers consent
+ * dialogs, which must not happen implicitly at session start.
+ */
+function linuxMissingPrereqs(): string[] {
+	const which = (bin: string): boolean => {
+		try {
+			const res = require("node:child_process")
+				.spawnSync("sh", ["-c", `command -v ${bin}`], { encoding: "utf-8" });
+			return res.status === 0;
+		} catch {
+			return false;
+		}
+	};
+	const missing: string[] = [];
+	if (!which("spectacle")) missing.push("spectacle (screen capture)");
+	if (!which("convert") && !which("magick")) missing.push("ImageMagick (image downsize)");
+	if (!which("kscreen-doctor") && !which("wlr-randr")) {
+		missing.push("kscreen-doctor or wlr-randr (display geometry)");
+	}
+	for (const mod of ["dbus", "gi"]) {
+		const ok = require("node:child_process")
+			.spawnSync("python3", ["-c", `import ${mod}`], { encoding: "utf-8" }).status === 0;
+		if (!ok) missing.push(`python3-${mod.replace("gi", "gobject")} (python ${mod})`);
+	}
+	if (!process.env.WAYLAND_DISPLAY && !process.env.DISPLAY) {
+		missing.push("no graphical session (WAYLAND_DISPLAY / DISPLAY unset)");
+	}
+	return missing;
 }

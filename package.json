@@ -1,8 +1,12 @@
 {
   "name": "pi-computer-use",
   "version": "0.1.0",
-  "description": "Pi extension for GUI computer-use on macOS",
-  "keywords": ["pi-package"],
+  "description": "Pi extension for GUI computer-use on macOS and Linux/Wayland",
+  "keywords": ["pi-package", "computer-use", "gui", "wayland", "kde", "macos"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gunchev/pi-computer-use.git"
+  },
   "type": "module",
   "pi": {
     "extensions": ["./src/index.ts"]
